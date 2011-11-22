@@ -79,7 +79,7 @@ class DHCPServer(ThreadingUDPServer):
         try:
             self.package = request[0]
             
-            'BxBxL'
+            'BxBxL4x4I16B192xI'
             self.shutdown_request(request)
         except:
             self.handle_error(request, client_address)
