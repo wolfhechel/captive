@@ -21,6 +21,46 @@ from argparse import ArgumentParser, FileType
 from SocketServer import ThreadingUDPServer
 from time import strftime
 import socket, struct
+
+class DNSQuery:
+  def __init__(self, data):
+    self.data=data
+    self.domain=''
+
+    type = (ord(data[2]) >> 3) & 15   # Opcode bits
+    if type == 0:                     # Standard query
+      start=12
+      len=ord(data[start])
+      while len != 0:
+        self.domain+=data[start+1:start+len+1]+'.'
+        start+=len+1
+        len=ord(data[start])
+
+  def response(self, ip):
+    packet=''
+    if self.domain:
+      packet+=self.data[:2] + "\x81\x80"
+      packet+=self.data[4:6] + self.data[4:6] + '\x00\x00\x00\x00'   # Questions and Answers Counts
+      packet+=self.data[12:]                                         # Original Domain Name Question
+      packet+='\xc0\x0c'                                             # Pointer to domain name
+      packet+='\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04'             # Response type, ttl and resource data length -> 4 bytes
+      packet+=str.join('',map(lambda x: chr(int(x)), ip.split('.'))) # 4bytes of IP
+    return packet
+''' if __name__ == '__maain__':
+  ip='192.168.1.1'
+  
+  udps = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  udps.bind(('',53))
+  
+  try:
+    while 1:
+      data, addr = udps.recvfrom(1024)
+      p=DNSQuery(data)
+      udps.sendto(p.response(ip), addr)
+      print 'Responded: %s -> %s' % (p.domain, ip)
+  except KeyboardInterrupt:
+    print 'Done'
+    udps.close() '''
  
 def logger(msg, *args):
     ''' Writes information to specified logging output.
@@ -66,34 +106,133 @@ def inet_iton(integer_ip):
     '''
     return struct.pack('<I', integer_ip)
 
+class Clients:
+    
+    PENDING     = 0x01
+    ESTABLISHED = 0x02
+    AUTHORIZED  = 0x03
+    
+    current = 1
+    
+    leases = {}
+    
+    def __init__(self, addr, mask):
+        
+        self.addr = addr
+        self.i_addr = inet_ntoi(self.addr)
+        self.mask = mask
+        self.i_mask = inet_ntoi(self.mask)
+        
+        self.subn = self.i_addr & self.i_mask
+        
+        self.hosts = (self.i_mask ^ 0xffffffff)
+
+    def offer_lease(self, mac):
+        while True:
+            self.current += 1
+        
+            lease_ip = self.subn + self.hosts[self.current]
+            
+            if lease_ip != self.i_addr:
+                addr = inet_iton(lease_ip)
+                
+                break
+        
+        self.leases[addr] = {'state'  : self.PENDING,
+                             'client' : mac,
+                             'leased' : time()}
+    
+    def authorize_client(self, addr):
+        self.leases[addr]['state'] = self.AUTHORIZED
+        
+    def acknowledge(self, addr):
+        self.leases[addr]['state'] = self.ESTABLISHED
+        
+    def denounce(self, addr):
+        del self.leases[addr]
+
 class DHCPServer(ThreadingUDPServer):
     
     allow_reuse_address = True
     
-    _read_offset = 0
+    clients = None
     
-    def __init__(self, addr):
-        ThreadingUDPServer.__init__(self, (addr, 67), None)
+    static_options = None
+    
+    def __init__(self, addr, clients):
+        self.clients = clients
         
-    def process_request_thread(self, request, client_address):
-        try:
-            self.package = request[0]
+        broadcast = inet_iton(clients.subnet + clients.hosts + 1)
+        
+        # Set static options
+        self.server_opts = {
+                             1 : clients.mask, # Subnet mask
+                             3 : clients.addr, # Router address
+                             6 : clients.addr, # Domain Name Server address
+                            28 : broadcast,    # Broadcast address
+                            51 : 60 * 60,      # IP address lease time
+                            54 : clients.addr, # DHCP Server identifier
+                            58 : 60 * 30,      # Renewal time
+                            59 : 60 * 50       # Rebinding time
+                            }
+        
+        ThreadingUDPServer.__init__(self, (addr, 67), self.handle_message)
+    
+    def handle_message(self, request, *_):
+        self.data = [request[0], 0]
+        
+        header = self.read('2xBxI2xH4I16s192xI')
+        
+        if header.pop() != 0x63825363:
+            # Invalid message
+            return 
+        
+        client_mac = header[7][:header[0]]
+        xid = header[1]
+        
+        broadcast = True if 128 & header[2] else False
+        
+        addr = dict(zip(('client', 'your', 'server', 'gateway'), header[2:6]))
+        
+        options = {}
+        
+        while True:
+            opt = self.read('B')
             
-            'BxBxL4x4I16B192xI'
-            self.shutdown_request(request)
-        except:
-            self.handle_error(request, client_address)
-            self.shutdown_request(request)
-        
+            if opt == 0xff: # End option
+                break
+            elif opt == 0x00: # Padding
+                continue
+            else:
+                options[opt] = self.read('%dx' % self.read('B'))    
+
+        self.respond(xid, client_mac, broadcast, options)
+            
     def read(self, fmt):
-        data = struct.unpack_from('!' + fmt, self.package, self._read_offset)
-        self._read_offset += struct.calcsize(fmt)
+        data = struct.unpack_from('!%s' % fmt, self.data[0], self.data[1])
+        self.data[1] += struct.calcsize(fmt)
         
         if len(data) > 1:
-            return data
+            return list(data)
+        elif len(data) == 0:
+            return None
         else:
             return data[0]
-     
+
+    def respond(self, xid, client_mac, broadcast, options):
+        available_options = copy(self.server_opts)
+        available_options.update(options)
+        
+        
+        
+    def send_response(self, xid, msg, broadcast, ip, options={}):
+        if broadcast:
+            sock = self.socket
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
+        struct.pack('!4BI2H', 2, 1, 6, 0, xid, 0, 128 if broadcast else 0,
+                    )
 
     def server_bind(self):
         ' Use ioctl signal to resolve address from interface. '
@@ -137,4 +276,7 @@ if __name__ == '__main__':
     logger('Resolved interface %s to %s/%s', args.interface,
            socket.inet_ntoa(addr), socket.inet_ntoa(mask))
     
-    DHCPServer(addr).handle_request()
+    
+    clients = Clients(addr, mask)
+    
+    DHCPServer(addr, clients).serve_forever()
