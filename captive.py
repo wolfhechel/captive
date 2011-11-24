@@ -22,6 +22,7 @@ from SocketServer import ThreadingUDPServer
 from time import strftime
 import socket, struct
 
+'''
 class DNSQuery:
   def __init__(self, data):
     self.data=data
@@ -46,7 +47,7 @@ class DNSQuery:
       packet+='\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04'             # Response type, ttl and resource data length -> 4 bytes
       packet+=str.join('',map(lambda x: chr(int(x)), ip.split('.'))) # 4bytes of IP
     return packet
-''' if __name__ == '__maain__':
+ if __name__ == '__maain__':
   ip='192.168.1.1'
   
   udps = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -219,21 +220,8 @@ class DHCPServer(ThreadingUDPServer):
         else:
             return data[0]
 
-    def respond(self, xid, client_mac, broadcast, options):
-        available_options = copy(self.server_opts)
-        available_options.update(options)
+    def respond(self, xid, client_mac, broadcast):
         
-        
-        
-    def send_response(self, xid, msg, broadcast, ip, options={}):
-        if broadcast:
-            sock = self.socket
-        else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            
-        struct.pack('!4BI2H', 2, 1, 6, 0, xid, 0, 128 if broadcast else 0,
-                    )
-
     def server_bind(self):
         ' Use ioctl signal to resolve address from interface. '
         
