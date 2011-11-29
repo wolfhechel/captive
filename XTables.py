@@ -20,6 +20,7 @@
 from socket import *
 from os import strerror, _get_exports_list
 from ctypes import POINTER, CDLL, c_int, c_void_p, byref, create_string_buffer
+from struct import unpack_from, pack
 
 SO_SET_REPLACE          = 0
 SO_SET_ADD_COUNTERS     = 1
@@ -36,6 +37,8 @@ NF_INET_LOCAL_OUT           = 3
 NF_INET_POST_ROUTING        = 4
 NF_INET_NUMHOOKS            = 5
 
+XT_TABLE_MAXNAMELEN         = 32
+XT_EXTENSION_MAXNAMELEN     = 29
 XT_TABLE_MAXNAMELEN         = 32
 
 COUNTER_MAP_NOMAP           = 0
@@ -134,19 +137,48 @@ class BaseTable:
     ' Share our sockets between all tables. '
     _socks = {}
     
+    hooks = []
+
     def __init__(self, table):
         ''' We try to maintain references to a minimal set of sockets only,
         meaning if a socket of our family already exists that's the one we want
         to use. '''
         if self.af not in self._socks.keys():
             self._socks[self.af] = socket(self.af, SOCK_RAW, IPPROTO_RAW)
-        
+   
         self.table = table
-        
-        info = self.getsockopt(SO_GET_INFO, self.table, 84)
-        
-        print info.encode('hex')
-        
+
+        self._initiate_table()
+
+    def _initiate_table(self):
+        raw = self.getsockopt(SO_GET_INFO, self.table, 84)
+
+        name, valid_hooks = unpack_from('%dsI' % XT_TABLE_MAXNAMELEN, raw)
+
+        if self.table != name.strip('\0'):
+            raise ValueError('Table name does not match name obtained info.')
+
+        hook_entry = unpack_from('%dI' % NF_INET_NUMHOOKS, raw,
+                                 XT_TABLE_MAXNAMELEN + 4)
+
+        for hook in range(NF_INET_NUMHOOKS):
+            if valid_hooks & (1 << hook):
+                entry = hook_entry[hook]
+            else:
+                entry = None
+
+            self.hooks.append(entry)
+
+        # Ignoring underflows, what are they for anyway?
+
+        num_entries, size = unpack_from('2I', raw, 76)
+
+        alloc_size = XT_TABLE_MAXNAMELEN + 4 + size
+        # TODO: Continue from here
+        entries = self.getsockopt(SO_GET_ENTRIES, , alloc_size)
+
+        print entries
+
     def getsockopt(self, opt, value, buflen=None):
         return self._socks[self.af].getsockopt(IPPROTO_IP, self.base_ctl + opt,
                                                value, buflen)
@@ -163,3 +195,6 @@ class IPv6(BaseTable):
     
 class ARP(IPv4):
     base_ctl = 96
+
+if __name__ == '__main__':
+    IPv4('filter')
