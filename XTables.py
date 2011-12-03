@@ -18,9 +18,8 @@
 #
 
 from socket import *
-from os import strerror, _get_exports_list
-from ctypes import POINTER, CDLL, c_int, c_void_p, byref, create_string_buffer
-from struct import unpack_from, pack
+from os import strerror
+from ctypes import *
 
 SO_SET_REPLACE          = 0
 SO_SET_ADD_COUNTERS     = 1
@@ -39,7 +38,6 @@ NF_INET_NUMHOOKS            = 5
 
 XT_TABLE_MAXNAMELEN         = 32
 XT_EXTENSION_MAXNAMELEN     = 29
-XT_TABLE_MAXNAMELEN         = 32
 
 COUNTER_MAP_NOMAP           = 0
 COUNTER_MAP_NORMAL_MAP      = 1
@@ -64,80 +62,58 @@ libc_handle.getsockopt.argtypes = (c_int,           # socket
                                    c_void_p,        # option_value
                                    POINTER(c_int))  # option_len
 
-class socket(SocketType):
-    def getsockopt(self, level, optname, value, buflen=None):
-        buf = create_string_buffer(value, buflen)
-        size = c_int(len(buf))
-        
-        libc_handle.getsockopt(self.fileno(), level, optname, buf, byref(size))
-        
-        return buf.raw
+class Entry(Structure):
+    _fields_ = [('src', c_uint),
+                ('dst', c_uint),
+                ('smsk', c_uint),
+                ('dmsk', c_uint),
+                ('iniface', c_char * 16),
+                ('outiface', c_char * 16),
+                ('iniface_mask', c_ubyte * 16),
+                ('outiface_mask', c_ubyte * 16),
+                ('proto', c_int16),
+                ('flags', c_int8),
+                ('invflags', c_int8),
+                ('nfcache', c_uint),
+                ('target_offset', c_int16),
+                ('next_offset', c_int16),
+                ('comefrom', c_uint),
+                ('pcnt', c_uint64),
+                ('bcnt', c_uint64),
+                ('elems', c_ubyte * 0)]
 
-SocketType = socket
+class GetEntries(Structure):
+    _fields_ = [('name', c_char * XT_TABLE_MAXNAMELEN),
+                ('size', c_uint),
+                ('entrytable', Entry * 0)]
 
-__all__ = ['IPv4', 'IPv6', 'ARP']
+    def __init__(self, *args, **kwargs):
+        if len(args) > 1:
+            size = args[1]
+        elif 'size' in kwargs.keys():
+            size = kwargs['size']
+        else:
+            raise ValueError('Missing required size initial value')
 
-''' There's a really horrible nest of relations in the iptables core,
-first of all. There's three familites that each has their own set of tables:
- * IPv4
- * IPv6
- * ARP
+        resize(self, sizeof(self) + size)
+        Structure.__init__(self, *args, **kwargs)
 
-Each of them has a fixed set of tables;
- * filter - Filters packets. 
- * nat - Translates addresses for routing.
- * mangle - Alters and trashes packets.
- * raw - 
+class BaseTable(Structure):
+    _fields_ = [('name', c_char * XT_TABLE_MAXNAMELEN),
+                ('valid_hooks', c_uint),
+                ('hook_entry', c_uint * NF_INET_NUMHOOKS),
+                ('underflow', c_uint * NF_INET_NUMHOOKS),
+                ('num_entries', c_uint),
+                ('size', c_uint)]
 
-In these tables there's s couple of chains, or hooks if you prefer (right?):
- * INPUT - Packets addressed to our local machine.
- * OUTPUT - Packets addressed from our local machine.
- * FORWARD - Packets addressed to some remote machine (we're doing routing!).
- * PREROUTING - Mangling packets before routing.
- * POSTROUTING - Mangling packets after routing.
-A user can create new chains and make a `jump' from one chain to another.
-
-Then there's targets specified for chains. (Oh and also; each chain has it's
- default policy.):
- * ACCEPT - Packet is accepted.
- * DROP - Packet is dropped.
- * REJECT - Packet is rejected.
- * logaccept - ACCEPT and log.
- * logdrop - DROP and log.
- * logreject - Take a guess?
- * DNAT - Altering packet destination address.
- * SNAT - Altering packet source address.
- * TRIGGER - Port triggering, redring input ports based on output traffic.
-Additional targets may be defined by extensions.
-
-Right, so a chain can contain several entries in sequence. (Chain, duh?)
-(Entries are usualy refered to as rules, however not in the core code.)
-Basically, if a rule matches then the iteration breaks and the chain `returns'.
-If not, then naturally the iteration continues. If the packet doesn't match any
-rule then the default chain policy is used.
-
-So, the relation looks as such;
-
-  Family -> Table -> Chain -> Entries [-> Default policy] 
-
-Now that you know that you'll have no problem what so ever to understand why
-this package hierarchy is composed the way it is.
-'''
-
-class BaseTable:
-    
     " Because we want inheritance, let's avoid setting a default family. "
     af = None
     
     ' This is true for IPv4 and IPv6, ARP overrides this.'
     base_ctl = 64
     
-    table = None
-    
     ' Share our sockets between all tables. '
     _socks = {}
-    
-    hooks = []
 
     def __init__(self, table):
         ''' We try to maintain references to a minimal set of sockets only,
@@ -145,44 +121,30 @@ class BaseTable:
         to use. '''
         if self.af not in self._socks.keys():
             self._socks[self.af] = socket(self.af, SOCK_RAW, IPPROTO_RAW)
-   
-        self.table = table
+            
+        Structure.__init__(self, table)
+        self.getsockopt(SO_GET_INFO, self)
 
-        self._initiate_table()
+        self.entries = GetEntries(self.name, self.size)
+        
+        self.getsockopt(SO_GET_ENTRIES, self.entries)
 
-    def _initiate_table(self):
-        raw = self.getsockopt(SO_GET_INFO, self.table, 84)
+        entry = (Entry *
+                self.num_entries).from_address(addressof(self.entries.entrytable))
 
-        name, valid_hooks = unpack_from('%dsI' % XT_TABLE_MAXNAMELEN, raw)
-
-        if self.table != name.strip('\0'):
-            raise ValueError('Table name does not match name obtained info.')
-
-        hook_entry = unpack_from('%dI' % NF_INET_NUMHOOKS, raw,
-                                 XT_TABLE_MAXNAMELEN + 4)
-
-        for hook in range(NF_INET_NUMHOOKS):
-            if valid_hooks & (1 << hook):
-                entry = hook_entry[hook]
-            else:
-                entry = None
-
-            self.hooks.append(entry)
-
-        # Ignoring underflows, what are they for anyway?
-
-        num_entries, size = unpack_from('2I', raw, 76)
-
-        alloc_size = XT_TABLE_MAXNAMELEN + 4 + size
-        # TODO: Continue from here
-        entries = self.getsockopt(SO_GET_ENTRIES, , alloc_size)
-
-        print entries
+        print entry[0].pcnt
 
     def getsockopt(self, opt, value, buflen=None):
-        return self._socks[self.af].getsockopt(IPPROTO_IP, self.base_ctl + opt,
-                                               value, buflen)
-        
+        if buflen is None:
+            buflen = sizeof(value)
+
+        size = c_int(buflen)
+
+        libc_handle.getsockopt(self._socks[self.af].fileno(), IPPROTO_IP,
+                self.base_ctl + opt, byref(value), byref(size))
+
+        return size
+
     def setsockopt(self, opt, value):
         return self._socks[self.af].setsockopt(IPPROTO_IP, self.base_ctl + opt,
                                                value)
