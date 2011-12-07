@@ -16,6 +16,27 @@
 # You should have received a copy of the GNU General Public License
 # along with this software.  If not, see <http://www.gnu.org/licenses/>.
 #
+'''
+0:0 new builtin chain: 0x18206c0 (rules=0x1820720)
+0:0 normal rule: 0x1820750: standard, verdict=-2
+
+1:352 normal rule: 0x1820900: standard, verdict=-1
+
+2:704 normal rule: 0x1820ab0: standard, verdict=-2
+
+3:856 new builtin chain: 0x1820b90 (rules=0x1820bf0)
+iptcc_delete_rule: deleting rule 0x1820ab0 (offset 704)
+3:856 normal rule: 0x1820ab0: standard, verdict=-2
+
+4:1008 normal rule: 0x1820c20: standard, verdict=-2
+
+5:1160 new builtin chain: 0x1820d00 (rules=0x1820d60)
+iptcc_delete_rule: deleting rule 0x1820c20 (offset 1008)
+5:1160 normal rule: 0x1820c20: standard, verdict=-2
+
+6:1312: end of table:
+iptcc_delete_rule: deleting rule 0x1820c20 (offset 1160)
+'''
 
 from socket import *
 from os import strerror
@@ -62,7 +83,10 @@ libc_handle.getsockopt.argtypes = (c_int,           # socket
                                    c_void_p,        # option_value
                                    POINTER(c_int))  # option_len
 
-def xt_generator(type_, attr, address, size, offset=0):
+''' Table blob parsery!
+Parse over size bytes from memory address, yielding new type structures
+and incrementing the offset by integer returned by type_.attr. '''
+def blob_generator(type_, attr, address, size, offset=0):
     while offset < size:
         data = type_.from_address(address + offset)
         offset += data.__getattribute__(attr)
@@ -89,7 +113,10 @@ class Match(Structure):
                 ('data', c_ubyte * 0)]
     
     def __repr__(self):
-        return " -> Match [0x%x] Size: %d" % (addressof(self), self.match_size)
+        return 'Match [0x%x] "%s", %d bytes, rev. %d' % (addressof(self),
+                                                         self.name,
+                                                         self.match_size,
+                                                         self.revision)
 
 class Entry(Structure):
     _fields_ = [('ip', BaseIP),
@@ -121,11 +148,14 @@ class BaseTable(Structure):
     " Because we want inheritance, let's avoid setting a default family. "
     family = None
     
-    ' This is true for IPv4 and IPv6, ARP overrides this.'
+    ' Base control signal integer. '
     base_ctl = None
     
     ' Share our sockets between all tables. '
     _socks = {}
+
+    ' Our hooks and respective pointers. '
+    _hooks = []
 
     def __init__(self, table):
         ''' We try to maintain references to a minimal set of sockets only,
@@ -134,22 +164,29 @@ class BaseTable(Structure):
         if self.family not in self._socks.keys():
             self._socks[self.family] = socket(self.family, SOCK_RAW,
                                               IPPROTO_RAW)
-            
         Structure.__init__(self, table)
         self.getsockopt(SO_GET_INFO, self)
 
-        entries = Entries(self.name, self.size)
-        self.getsockopt(SO_GET_ENTRIES, entries, sizeof(entries) + self.size)
+        self.entries = Entries(self.name, self.size)
+        self.getsockopt(SO_GET_ENTRIES, self.entries,
+                        sizeof(Entries) + self.size)
 
-        addr = addressof(entries.entrytable)
+        self._traverse_table(addressof(self.entries.entrytable),
+                             self.entries.size)
 
-        for entry in xt_generator(Entry, 'next_offset', addr, entries.size):
+    def _traverse_table(self, addr, size):
+        for entry in blob_generator(Entry, 'next_offset', addr, size):
             print repr(entry)
             
-            for match in xt_generator(Match, 'match_size', addr,
-                                      entry.target_offset, sizeof(entry)):
+            ''' The internals of libiptc deals the last match as the target,
+            while it might prove to be usefull I at this point don't seem how
+            since both structures are identical. '''
+            
+            for match in blob_generator(Match, 'match_size', addr,
+                                      entry.next_offset, sizeof(entry)):
                 print repr(match)
-        
+            
+    
     def getsockopt(self, opt, value, buflen=None):
         if buflen is None:
             buflen = sizeof(value)
